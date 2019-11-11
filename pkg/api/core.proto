@@ -1,0 +1,71 @@
+syntax = "proto3";
+
+package api;
+
+option go_package = "api";
+
+import "google/protobuf/timestamp.proto";
+
+message Value {
+  string scope = 1;
+  string key = 2;
+  bytes value = 3;
+  google.protobuf.Timestamp created_at = 4;
+  uint64 revision = 5;
+  bytes hash = 7;
+}
+
+message Snapshot {
+	google.protobuf.Timestamp time = 1;
+}
+
+message SetRequest {
+  string scope = 1;
+  string key = 2;
+  bytes value = 3;
+}
+
+message GetRequest {
+  string scope = 1;
+  string key = 2;
+  uint64 revision = 3;
+}
+
+message DeleteRequest {
+  string scope = 1;
+  string key = 2;
+}
+
+message ListRequest {
+  string scope = 1;
+  string key = 2;
+}
+
+message RollbackRequest {
+  string scope = 1;
+  string key = 2;
+  google.protobuf.Timestamp time = 4;
+}
+
+message RollbackResult {
+  uint64 affected_rows = 1;
+}
+
+message HashRequest {
+	string scope = 1;
+	string key = 2;
+	uint64 revision = 3;
+}
+
+message HashResponse {
+	bytes hash = 1;
+}
+
+service State {
+  rpc Set(SetRequest) returns (Value);
+  rpc Get(GetRequest) returns (Value);
+  rpc Delete(GetRequest) returns (Value);
+  rpc List(ListRequest) returns (stream Value);
+  rpc Rollback(RollbackRequest) returns (RollbackResult);
+	rpc Hash(HashRequest) returns (HashResponse);
+}
