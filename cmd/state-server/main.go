@@ -27,22 +27,34 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt)
-
+	go func(){
+		<-c
+		cancel()
+	}()
+	
 	var (
 		db  *sql.DB
 		err error
 	)
 	err = backoff.Retry(func() error {
-		db, err = sql.Open("postgres", *dbStr)
-		if err != nil {
-			return err
+		select {
+		case <-ctx.Done():
+			return backoff.Permanent(ctx.Err())
+		default:
+			db, err = sql.Open("postgres", *dbStr)
+			if err != nil {
+				return err
+			}
+			err = db.Ping()
+			if err != nil {
+				return err
+			}
+			return nil
 		}
-		err = db.Ping()
-		if err != nil {
-			return err
-		}
-		return nil
 	}, backoff.NewExponentialBackOff())
+	if err != nil {
+		logrus.Fatal(err)
+	}
 
 	// setup grpc server with options
 	grpcServer, err := grpcserver.New(&grpcserver.Config{
@@ -69,12 +81,7 @@ func main() {
 	}
 
 	// start server
-	go func() {
-		if err := grpcserver.ListenAndServe(ctx, *listenAddr, grpcServer); err != nil {
-			logrus.Fatal(err)
-		}
-	}()
-
-	<-c
-	cancel()
+	if err := grpcserver.ListenAndServe(ctx, *listenAddr, grpcServer); err != nil {
+		logrus.Fatal(err)
+	}
 }

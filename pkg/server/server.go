@@ -148,8 +148,8 @@ func (s *stateServer) Rollback(ctx context.Context, req *api.RollbackRequest) (*
 func (s *stateServer) List(req *api.ListRequest, srv api.State_ListServer) error {
 	psql := sq.StatementBuilder.PlaceholderFormat(sq.Dollar).RunWith(s.db)
 	filter := sq.And{sq.Eq{"values.scope": req.Scope}}
-	if req.Key != "" {
-		filter = sq.And{filter, sq.Eq{"values.key": req.Key}}
+	if req.Prefix != "" {
+		filter = sq.And{filter, sq.Like{"values.key": req.Prefix + "%"}}
 	}
 	rows, err := psql.Select("distinct on(values.scope, values.key) values.key", "values.value", "values.revision", "values.created_at", "hashes.hash").
 		From("values").
@@ -182,11 +182,11 @@ func (s *stateServer) List(req *api.ListRequest, srv api.State_ListServer) error
 	return nil
 }
 
-func (s *stateServer) Hash(ctx context.Context, req *api.HashRequest) (*api.HashResponse, error) {
+func (s *stateServer) Hash(ctx context.Context, req *api.HashRequest) (res *api.HashResponse, err error) {
 	psql := sq.StatementBuilder.PlaceholderFormat(sq.Dollar).RunWith(s.db)
 	var row squirrel.RowScanner
 	if req.Revision > 0 {
-		row = psql.Select("hash").From("hashes").
+		row = psql.Select("hash", "revision").From("hashes").
 			Where(squirrel.Eq{
 				"scope":    req.Scope,
 				"key":      req.Key,
@@ -194,7 +194,7 @@ func (s *stateServer) Hash(ctx context.Context, req *api.HashRequest) (*api.Hash
 			}).
 			QueryRowContext(ctx)
 	} else {
-		row = psql.Select("hash").From("hashes").
+		row = psql.Select("hash", "revision").From("hashes").
 			Where(squirrel.Eq{
 				"scope": req.Scope,
 				"key":   req.Key,
@@ -203,12 +203,16 @@ func (s *stateServer) Hash(ctx context.Context, req *api.HashRequest) (*api.Hash
 			Limit(1).
 			QueryRowContext(ctx)
 	}
-	var hash []byte
-	err := row.Scan(&hash)
+
+	res = &api.HashResponse{
+		Hash: make([]byte, 0, 32),
+	}
+
+	err = row.Scan(&res.Hash, &res.Revision)
 	if err != nil {
 		return nil, err
 	}
-	return &api.HashResponse{Hash: hash}, nil
+	return res, nil
 }
 
 func (s *stateServer) set(ctx context.Context, tx *sql.Tx, req *api.SetRequest) (_ *api.Value, err error) {
@@ -271,7 +275,13 @@ func (s *stateServer) get(ctx context.Context, runner squirrel.BaseRunner, req *
 }
 
 func (s *stateServer) updateHash(ctx context.Context, tx *sql.Tx, scope string, path []string, value []byte, now time.Time) error {
-	logrus.Debugf("update hash of %v  to %x", path, value[:8])
+	log := logrus.WithFields(logrus.Fields{
+		"fn":    "updateHashe",
+		"scope": scope,
+		"path":  path,
+		"value": value,
+	})
+	log.Debug("write hash to db")
 	lastRevision := 0
 	psql := sq.StatementBuilder.PlaceholderFormat(sq.Dollar).RunWith(tx)
 	row := psql.Select("revision").From("hashes").
@@ -297,12 +307,20 @@ func (s *stateServer) updateHash(ctx context.Context, tx *sql.Tx, scope string, 
 }
 
 func (s *stateServer) updateHashes(ctx context.Context, tx *sql.Tx, scope string, path []string, key string, value []byte, now time.Time) error {
+	log := logrus.WithFields(logrus.Fields{
+		"fn":   "updateHashes",
+		"path": path,
+	})
+	log.Debug("start updating hashes")
 	psql := sq.StatementBuilder.PlaceholderFormat(sq.Dollar).RunWith(tx)
 	var hash []byte
-	hash = make([]byte, 32)
-	leafHasher := sha3.NewShake256()
-	_, _ = leafHasher.Write(value)
-	_, _ = leafHasher.Read(hash[:])
+	if len(value) > 0 {
+		log.Println("compute leaf hash")
+		hash = make([]byte, 32)
+		leafHasher := sha3.NewShake256()
+		_, _ = leafHasher.Write(value)
+		_, _ = leafHasher.Read(hash[:])
+	}
 	err := s.updateHash(ctx, tx, scope, path, hash, now)
 	if err != nil {
 		return errors.Wrap(err, "failed to hash leaf hash")
@@ -310,6 +328,7 @@ func (s *stateServer) updateHashes(ctx context.Context, tx *sql.Tx, scope string
 	lastPath := path
 	for i := 0; i < len(path)-1; i++ {
 		currentPath := path[:len(path)-i-1]
+		log.Debugf("update parent path %v", currentPath)
 		_, err = psql.Insert("childs").Columns("scope", "parent", "child").
 			Values(scope, strings.Join(currentPath, "/"), strings.Join(lastPath, "/")).
 			Suffix("ON CONFLICT(scope,parent,child) DO NOTHING").
@@ -317,7 +336,7 @@ func (s *stateServer) updateHashes(ctx context.Context, tx *sql.Tx, scope string
 		if err != nil {
 			logrus.Warn(err)
 		}
-		rows, err := psql.Select("DISTINCT ON (hashes.scope,hashes.key) hash").
+		rows, err := psql.Select("DISTINCT ON (hashes.scope,hashes.key) hash, key").
 			From("hashes").
 			Join("childs ON key = child").
 			Where(sq.Eq{
@@ -330,14 +349,22 @@ func (s *stateServer) updateHashes(ctx context.Context, tx *sql.Tx, scope string
 		}
 		hasher := sha3.NewShake256()
 		for rows.Next() {
-			var childHash []byte
-			if err = rows.Scan(&childHash); err != nil {
+			var (
+				childHash []byte
+				key       string
+			)
+			if err = rows.Scan(&childHash, &key); err != nil {
 				return errors.Wrap(err, "failed to scan child hash")
 			}
 			if len(childHash) > 0 {
+				log.
+					WithField("child", key).
+					WithField("hash", childHash).
+					Debug("add child hash")
 				_, _ = hasher.Write(childHash)
 			}
 		}
+		hash := make([]byte, 32)
 		_, _ = hasher.Read(hash[:])
 		err = s.updateHash(ctx, tx, scope, currentPath, hash, now)
 		if err != nil {

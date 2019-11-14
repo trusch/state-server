@@ -38,7 +38,7 @@ message DeleteRequest {
 
 message ListRequest {
   string scope = 1;
-  string key = 2;
+  string prefix = 2;
 }
 
 message RollbackRequest {
@@ -59,6 +59,7 @@ message HashRequest {
 
 message HashResponse {
 	bytes hash = 1;
+	uint64 revision = 2;
 }
 
 service State {
